@@ -17,10 +17,22 @@ Standard library only. Usage:
 
 Sides: left, right, top, bottom, all. Ctrl+C stops and restores the lights.
 
-run is tuned to be calm: colours are averaged over --smooth seconds, each
-update fades for as long as the gap to the next one, changes smaller than
---deadzone are skipped, and lights that share a side are driven as one Hue
-group so they change at the same instant (--no-group turns that off).
+run boosts saturation (--saturation), because the TV reports the muted
+average of the picture's edge, not the vivid colour its own LEDs show. It is
+also tuned to be calm. The TV is polled --fps times a second, and what the
+lights do depends on how big the change is:
+
+  - a big change (--cut, a scene cut) goes to the lights at once, short fade
+  - anything smaller drifts: averaged over --smooth seconds and sent at most
+    every --drift seconds with a fade that long
+  - changes below --deadzone are not sent at all
+
+Lights that share a side are driven as one Hue group so they change at the
+same instant (--no-group turns that off).
+
+While the TV's Ambilight is switched off, or the TV is in standby, the lights
+go back to how they were, and syncing resumes when Ambilight is back
+(--no-follow syncs regardless).
 
 PoC note: this uses the normal Hue REST API, which is limited to roughly 10
 light commands or 1 group command per second in total, so more lights =
@@ -29,6 +41,8 @@ smooth 25+ fps streaming.
 """
 import argparse
 import base64
+import colorsys
+import fcntl
 import hashlib
 import hmac
 import http.client
@@ -40,6 +54,7 @@ import signal
 import ssl
 import string
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -54,10 +69,17 @@ SIDES = ("left", "right", "top", "bottom")
 # per second. Past that the bridge queues commands and the lights lag behind.
 HUE_LIGHT_COST = 0.1
 HUE_GROUP_COST = 1.0
-# Added to every channel before the colour is worked out. A near-black frame's
-# tint is mostly noise, and at a raised minimum brightness the lamp would show
-# it fully saturated. This pulls dark frames towards white instead.
-DARK_LIFT = 8
+# Below this level (0-255) a frame's colour fades towards white. A near-black
+# frame's tint is mostly noise, and at a raised minimum brightness the lamp
+# would otherwise show it fully saturated.
+DARK_FADE = 24
+# Fade for a scene cut, in 100ms steps: quick, but not a flash.
+CUT_FADE = 3
+# Seconds of averaging behind "what is on screen right now", which cuts are
+# detected on. One bright frame does not move it far enough to count.
+CUT_SMOOTH = 0.2
+# Seconds without an answer before the TV counts as switched off.
+TV_GONE_AFTER = 5
 
 # The TV uses a self-signed certificate.
 SSL_CTX = ssl.create_default_context()
@@ -260,6 +282,19 @@ def lit(layer):
     return any(p[c] > 0 for side in layer.values() for p in side.values() for c in "rgb")
 
 
+def find_nodes(tree, contexts, found=None):
+    """Maps settings-menu context names to their node ids."""
+    found = {} if found is None else found
+    if isinstance(tree, dict):
+        if tree.get("context") in contexts and tree.get("node_id") is not None:
+            found.setdefault(tree["context"], tree["node_id"])
+        tree = list(tree.values())
+    if isinstance(tree, list):
+        for item in tree:
+            find_nodes(item, contexts, found)
+    return found
+
+
 class Ambilight:
     """Polls the TV for per-side colours, reconnecting with backoff.
 
@@ -267,13 +302,26 @@ class Ambilight:
     2023 OLED708 among them) always answer it with black. In "auto" a black
     processed frame is checked against /ambilight/measured, and if that one
     has colour the reader stays on measured.
+
+    With follow=True a second connection checks once a second whether the
+    TV's Ambilight is switched on. /ambilight/power and
+    /ambilight/currentconfiguration say "off" on the OLED708 while the LEDs
+    are lit, so the answer comes from the settings menu: the Ambilight style
+    entry names its active child, and one of the children is Off. The query
+    is a POST, but it only reads.
     """
 
-    def __init__(self, cfg, source="auto"):
+    def __init__(self, cfg, source="auto", follow=False):
         self.tv = tv_client(cfg)
         self.auto = source == "auto"
         self.source = "processed" if self.auto else source
         self.backoff = 0
+        self.failing_since = None
+        # None until the first style check has answered.
+        self.on = None if follow else True
+        self.started = time.monotonic()
+        if follow:
+            threading.Thread(target=self._watch, args=(cfg,), daemon=True).start()
 
     def _get(self, source):
         data = self.tv.request("GET", f"ambilight/{source}")
@@ -281,9 +329,49 @@ class Ambilight:
             raise http.client.HTTPException(f"Unexpected Ambilight response: {str(data)[:200]}")
         return data["layer1"]
 
+    def _watch(self, cfg):
+        """Keeps self.on current. It has a thread and connection of its own
+        because about one style query in fifty takes the TV two seconds,
+        which would freeze the colour polling if they shared one."""
+        tv = tv_client(cfg)
+        nodes = None
+        while True:
+            try:
+                if nodes is None:
+                    structure = tv.request("GET", "menuitems/settings/structure")
+                    nodes = find_nodes(structure, ("ambilight_style", "ambilight_off"))
+                query = {"nodes": [{"nodeid": nodes["ambilight_style"]}]}
+                current = tv.request("POST", "menuitems/settings/current", query)
+                self.on = current["values"][0]["value"]["data"]["activenode_id"] != nodes["ambilight_off"]
+            except (KeyError, IndexError, TypeError):
+                print("This TV does not report its Ambilight style, syncing regardless of it.", file=sys.stderr)
+                self.on = True
+                return
+            except (OSError, http.client.HTTPException, ValueError, TVAuthError):
+                # Standby or a blip. read() is the one that notices a TV that
+                # is gone, so the last known answer stands.
+                tv.close()
+            time.sleep(1)
+
+    def idle(self):
+        """True when the lights should go back to how they were: Ambilight is
+        switched off, or the TV has not answered for a while (standby)."""
+        gone = self.failing_since is not None and time.monotonic() - self.failing_since > TV_GONE_AFTER
+        return self.on is False or gone
+
     def read(self):
-        """Returns the layer, or None after a failed read (it has slept already)."""
+        """Returns the layer, or None when there is nothing to show: a failed
+        read, or Ambilight switched off. It has slept already in both cases."""
         try:
+            if self.on is None and time.monotonic() - self.started < TV_GONE_AFTER:
+                # Not known yet. Waiting beats flashing the lights on a TV
+                # whose Ambilight turns out to be off.
+                time.sleep(0.05)
+                return None
+            if self.on is False:
+                self.failing_since = None
+                time.sleep(0.25)
+                return None
             layer = self._get(self.source)
             if self.auto and self.source == "processed" and not lit(layer):
                 measured = self._get("measured")
@@ -296,10 +384,14 @@ class Ambilight:
         except (OSError, http.client.HTTPException, ValueError) as e:
             self.tv.close()
             self.backoff = min(5, max(0.5, self.backoff * 2))
-            print(f"TV read failed ({e}), reconnecting in {self.backoff:g}s", file=sys.stderr)
+            if self.failing_since is None:
+                # Said once, not every retry: a TV in standby fails for hours.
+                self.failing_since = time.monotonic()
+                print(f"TV read failed ({e}), retrying until it answers", file=sys.stderr)
             time.sleep(self.backoff)
             return None
         self.backoff = 0
+        self.failing_since = None
         return layer
 
 
@@ -396,10 +488,22 @@ def cmd_lights(args):
         print(f"{lid:>3}  {light['name']:<30} {colour:<10} {power}")
 
 
+def vivid(rgb, gain):
+    """Boosts saturation the way the TV does for its own LEDs.
+
+    /ambilight/measured is the plain average of the picture's edge, which is
+    muted (saturation around 0.4 on typical content). The curve lifts that
+    without pushing greys into colour: 0.4 becomes 0.72 at the default gain.
+    """
+    h, s, v = colorsys.rgb_to_hsv(*(c / 255 for c in rgb))
+    s = (1 - (1 - s) ** gain) * min(1, v * 255 / DARK_FADE)
+    return tuple(c * 255 for c in colorsys.hsv_to_rgb(h, s, v))
+
+
 def rgb_to_hue(rgb, bri_min, bri_max):
     """sRGB 0-255 -> Hue CIE xy + bri (Wide RGB D65 conversion)."""
     def lin(c):
-        c = (c + DARK_LIFT) / (255 + DARK_LIFT)
+        c /= 255
         return ((c + 0.055) / 1.055) ** 2.4 if c > 0.04045 else c / 12.92
 
     r, g, b = (lin(c) for c in rgb)
@@ -409,6 +513,8 @@ def rgb_to_hue(rgb, bri_min, bri_max):
     total = x_ + y_ + z_
     level = bri_min + (bri_max - bri_min) * max(rgb) / 255
     bri = max(1, min(254, round(254 * level)))
+    if total == 0:
+        return (0.3227, 0.329), bri
     return (round(x_ / total, 4), round(y_ / total, 4)), bri
 
 
@@ -442,9 +548,6 @@ def hue_put(cfg, path, body, seen_errors=None):
 
 
 def restore_lights(cfg, saved):
-    # A second Ctrl+C must not leave half the lights on the TV's colours.
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    print("\nRestoring lights...")
     for lid, state in saved.items():
         path = f"/lights/{lid}/state"
         if state["on"]:
@@ -493,12 +596,32 @@ def hue_targets(cfg, lights, mapping, use_groups, created):
             # Left behind by a run that was killed before it could clean up.
             created.append(gid)
         targets.append({"side": side, "path": f"/groups/{gid}/action", "cost": HUE_GROUP_COST, "colour": True})
-    return targets
+    # Cheap commands first, so a single lamp is not held up behind a group.
+    return sorted(targets, key=lambda t: t["cost"])
+
+
+def blend(old, new, dt, seconds):
+    """Moves a running average towards a new sample."""
+    if seconds <= 0:
+        return new
+    weight = 1 - math.exp(-dt / seconds)
+    return tuple(o + (n - o) * weight for o, n in zip(old, new))
+
+
+def distance(a, b):
+    return max(abs(x - y) for x, y in zip(a, b))
 
 
 def cmd_run(args):
     cfg = load_config()
     require(cfg, "tv_ip", "tv_user", "hue_ip", "hue_user")
+    # Two syncs would fight over the lights, and the second one's cleanup
+    # would delete the first one's Hue group. The lock dies with the process.
+    lock = open(CONFIG_PATH)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        die("Another ambihue run is already driving the lights. Stop that one first.")
     if not 0 <= args.min_brightness <= args.brightness <= 1:
         die("Need 0 <= --min-brightness <= --brightness <= 1")
     lights = hue_request(cfg, "GET", f"/{cfg['hue_user']}/lights")
@@ -519,60 +642,94 @@ def cmd_run(args):
     # kill and a closed terminal restore the lights the same way Ctrl+C does.
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGHUP, interrupt)
-    ambilight = Ambilight(cfg, args.source)
-    saved = snapshot(lights, [lid for lid, _ in mapping])
+    ambilight = Ambilight(cfg, args.source, follow=args.follow)
+    ids = [lid for lid, _ in mapping]
+    saved = {}
+    synced = False  # True while the lights are ours and `saved` is what to put back
+    waiting = False
     created = []
     seen_errors = set()
     try:
         targets = hue_targets(cfg, lights, mapping, args.group, created)
-        interval = max(1 / args.fps, sum(t["cost"] for t in targets))
-        # A fade as long as the gap between updates gives a continuous drift
-        # instead of step, pause, step.
-        transition = args.transition if args.transition is not None else max(1, round(interval * 10))
+        drift_fade = args.transition if args.transition is not None else max(1, round(args.drift * 10))
+        cuts = args.cut > 0 and args.smooth > CUT_SMOOTH
         print(
-            f"Syncing {len(mapping)} light(s) with {len(targets)} command(s) every {interval:.1f}s, "
-            f"{transition / 10:g}s fade. Ctrl+C to stop."
+            f"Syncing {len(mapping)} light(s), polling the TV {args.fps:g}x/s. "
+            + (f"Cuts fade in {CUT_FADE / 10:g}s, the rest drifts" if cuts else "Drifting")
+            + f" every {args.drift:g}s. Ctrl+C to stop."
         )
-        # The TV is polled faster than the bridge can be updated, so the
-        # smoothing averages real samples instead of one frame per update.
-        tick = min(interval, 0.1)
-        next_send = 0
+        bridge_free = 0  # when the bridge's command budget allows the next send
         while True:
             start = time.monotonic()
             layer = ambilight.read()
             if layer is None:
+                if ambilight.idle() and not waiting:
+                    waiting = True
+                    if synced:
+                        restore_lights(cfg, saved)
+                        synced = False
+                    print("Ambilight is off or the TV is not answering. Leaving the lights alone until it is back.")
                 continue
+            if waiting:
+                waiting = False
+                print("Ambilight is back, syncing.")
+            if not synced:
+                # Taken fresh each time: the lights may have been changed by
+                # hand while Ambilight was off.
+                saved = snapshot(hue_request(cfg, "GET", f"/{cfg['hue_user']}/lights"), ids)
+                targets = [{k: t[k] for k in ("side", "path", "cost", "colour")} for t in targets]
+                synced = True
             for t in targets:
                 if t["side"] != "all" and len(layer.get(t["side"]) or {}) == 0:
                     die(f"The TV has no Ambilight LEDs on the {t['side']} side.")
                 rgb = side_average(layer, t["side"])
-                if args.smooth > 0 and t.get("rgb") is not None:
-                    weight = 1 - math.exp(-(start - t["at"]) / args.smooth)
-                    rgb = tuple(old + (new - old) * weight for old, new in zip(t["rgb"], rgb))
-                t["rgb"] = rgb
+                if t.get("calm") is None:
+                    t["now"] = t["calm"] = rgb
+                else:
+                    t["now"] = blend(t["now"], rgb, start - t["at"], CUT_SMOOTH)
+                    t["calm"] = blend(t["calm"], rgb, start - t["at"], args.smooth)
+                    if cuts and distance(t["now"], t["calm"]) >= args.cut:
+                        # Scene cut: drop both averages onto the newest frame
+                        # (the fast one is still only part of the way there)
+                        # and send it as soon as the bridge allows.
+                        t["now"] = t["calm"] = rgb
+                        t["cut"] = True
                 t["at"] = start
-            if start >= next_send:
-                next_send = start + interval
-                for t in targets:
-                    sent = t.get("sent")
-                    if sent is not None and max(abs(a - b) for a, b in zip(t["rgb"], sent)) < args.deadzone:
+            # Whoever has waited longest goes first, so one busy light cannot
+            # use up the whole bridge budget.
+            for t in sorted(targets, key=lambda t: t.get("sent_at", 0)):
+                if start < bridge_free:
+                    break
+                sent = t.get("sent")
+                cut = t.pop("cut", False)
+                if sent is not None and not cut:
+                    if start < t["drift_at"] or distance(t["calm"], sent) < args.deadzone:
                         continue
-                    xy, bri = rgb_to_hue(t["rgb"], args.min_brightness, args.brightness)
-                    body = {"bri": bri, "transitiontime": transition}
-                    if t["colour"]:
-                        body["xy"] = list(xy)
-                    if body == t.get("body"):
-                        continue
+                state = rgb_to_hue(vivid(t["calm"], args.saturation), args.min_brightness, args.brightness)
+                if state == t.get("state"):
+                    continue
+                body = {"bri": state[1], "transitiontime": CUT_FADE if cut else drift_fade}
+                if t["colour"]:
+                    body["xy"] = list(state[0])
+                if sent is None:
                     # "on" only goes out once: resending it slows the bridge,
                     # and a light switched off by hand mid-sync stays off.
-                    hue_put(cfg, t["path"], body if sent is not None else {**body, "on": True}, seen_errors)
-                    t["sent"] = t["rgb"]
-                    t["body"] = body
-            time.sleep(max(0, tick - (time.monotonic() - start)))
+                    body["on"] = True
+                hue_put(cfg, t["path"], body, seen_errors)
+                t["sent"] = t["calm"]
+                t["state"] = state
+                t["sent_at"] = start
+                t["drift_at"] = start + args.drift
+                bridge_free = start + t["cost"]
+            time.sleep(max(0, 1 / args.fps - (time.monotonic() - start)))
     except KeyboardInterrupt:
         pass
     finally:
-        restore_lights(cfg, saved)
+        # A second Ctrl+C must not leave half the lights on the TV's colours.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        if synced:
+            print("\nRestoring lights...")
+            restore_lights(cfg, saved)
         for gid in created:
             try:
                 hue_request(cfg, "DELETE", f"/{cfg['hue_user']}/groups/{gid}")
@@ -602,12 +759,17 @@ def main():
     sub.add_parser("lights", help="list Hue lights").set_defaults(fn=cmd_lights)
     sp = sub.add_parser("run", help="sync lights, e.g. run 3:left 5:right 7:top")
     sp.add_argument("mapping", nargs="*")
-    sp.add_argument("--fps", type=float, default=10, help="upper limit on updates per second")
+    sp.add_argument("--fps", type=float, default=20, help="TV polls per second")
     sp.add_argument("--brightness", type=float, default=1.0, help="lamp brightness for a white picture, 0-1")
     sp.add_argument("--min-brightness", type=float, default=0.0, help="lamp brightness for a black picture, 0-1")
+    sp.add_argument("--saturation", type=float, default=2.5, help="colour boost, 1 = the TV's raw colours")
     sp.add_argument("--smooth", type=float, default=1.5, help="seconds of colour averaging, 0 = off")
+    sp.add_argument("--cut", type=float, default=30, help="a change this big (0-255) goes out at once, 0 = never")
+    sp.add_argument("--drift", type=float, default=3, help="seconds between updates for smaller changes")
     sp.add_argument("--deadzone", type=float, default=4, help="skip colour changes smaller than this (0-255)")
-    sp.add_argument("--transition", type=int, help="Hue fade in 100ms steps (default: the gap between updates)")
+    sp.add_argument("--transition", type=int, help="fade for drift updates in 100ms steps (default: --drift)")
+    sp.add_argument("--follow", action=argparse.BooleanOptionalAction, default=True,
+                    help="restore the lights while the TV's Ambilight is off, resume when it is back")
     sp.add_argument("--group", action=argparse.BooleanOptionalAction, default=True,
                     help="drive lights that share a side as one Hue group")
     sp.add_argument("--source", **source)
